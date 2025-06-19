@@ -1,222 +1,421 @@
-import time, board, digitalio, rotaryio, alarm, microcontroller, analogio, adafruit_ble
+import time
+import board
+import digitalio
+import rotaryio
+import asyncio
+import keypad
+import alarm
+import microcontroller
+import _bleio
+
+import adafruit_ble
 from adafruit_ble.advertising import Advertisement
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
 from adafruit_ble.services.standard.hid import HIDService
-from adafruit_ble.services.standard.device_info import DeviceInfoService
-from adafruit_ble.services.standard import BatteryService
-from adafruit_hid.mouse import Mouse
-from adafruit_hid.keyboard import Keyboard
 from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
+from adafruit_ble.services.standard.device_info import DeviceInfoService
+
+from adafruit_hid.keyboard import Keyboard
 from adafruit_hid.keycode import Keycode
 
-print("Boot")
-INACTIVITY_TIMEOUT, LOOP_DELAY_CONNECTED, LOOP_DELAY_DISCONNECTED, LONG_PRESS_DURATION = 300, 0.01, 0.1, 2.0
-BATTERY_UPDATE_INTERVAL, MIN_BATT_VOLTAGE, MAX_BATT_VOLTAGE = 60, 3.0, 3.7
+print("Booting")
 
-# Corrected pins for Seeed Studio XIAO nRF52840 Sense
-# VBATT (P0.31) for sensing, READ_BATT_ENABLE (P0.14 / D9) to enable reading circuit.
-BATTERY_SENSE_PIN_ID = microcontroller.pin.P0_31 # board.VOLTAGE_MONITOR often maps to this
-BATTERY_ENABLE_PIN_ID = microcontroller.pin.P0_14 # board.D9 often maps to this
-CLICK_PIN_ID = board.D10
-ENCODER_A_PIN_ID = board.D7
-ENCODER_B_PIN_ID = board.D8
-LED_PIN_ID = board.LED # Assuming standard LED pin
+# Configuration constants
+INACTIVITY_TIMEOUT = 5 * 60  # 5 minutes
+LOOP_DELAY_CONNECTED = 0.01
+LOOP_DELAY_DISCONNECTED = 0.1  # Reduced from 1 second
+LONG_PRESS_DURATION = 5.0  # 5 seconds for long press
+SCROLL_DELAY = 0.20  # 200ms batching delay
+scroll_buffer = 0
+scroll_timer = 0
+last_scroll_direction = 0
 
-led = digitalio.DigitalInOut(LED_PIN_ID); led.direction = digitalio.Direction.OUTPUT; led.value = False
-click, enc, battery_sense_pin, battery_enable_pin = None, None, None, None
-ble, mouse, advertisement, scan_response, battery_service = None, None, None, None, None
 
-hardware_initialized = False
+# Initialize hardware
+led = digitalio.DigitalInOut(board.LED)
+led.direction = digitalio.Direction.OUTPUT
+led.value = False
 
-# Helper function to safely deinitialize an object
-def _safe_deinit(obj):
-    if obj:
-        try: obj.deinit()
-        except: pass
-
-def _read_and_update_battery_info(current_time_val):
-    global last_battery_update_time, battery_service, battery_sense_pin, battery_enable_pin
-    batt_level, batt_voltage = 0, 0.0
-    if battery_sense_pin and battery_enable_pin:
-        try:
-            battery_enable_pin.value = False; time.sleep(0.01); adc_value = battery_sense_pin.value; battery_enable_pin.value = True
-            adc_voltage = (adc_value / 65535) * battery_sense_pin.reference_voltage
-            actual_voltage = adc_voltage * (1510.0 / 510.0)
-            clamped_voltage = max(MIN_BATT_VOLTAGE, min(MAX_BATT_VOLTAGE, actual_voltage))
-            batt_level = int(max(0, min(100, ((clamped_voltage - MIN_BATT_VOLTAGE) / (MAX_BATT_VOLTAGE - MIN_BATT_VOLTAGE)) * 100)))
-            batt_voltage = actual_voltage
-        except Exception as e: print(f"Battery read error: {e}"); battery_enable_pin.value = True; batt_level, batt_voltage = 0,0.0
-    
-    if battery_service: battery_service.level = batt_level
-    print(f"Battery: {batt_level}% ({batt_voltage:.1f}V)"); last_battery_update_time = current_time_val
-
-def _critical_halt(message, blink_delay=0.5):
-    print(message)
-    while True: led.value = not led.value; time.sleep(blink_delay)
-
-try:
-    click = digitalio.DigitalInOut(CLICK_PIN_ID); click.direction = digitalio.Direction.INPUT; click.pull = digitalio.Pull.UP
-    enc = rotaryio.IncrementalEncoder(ENCODER_A_PIN_ID, ENCODER_B_PIN_ID)
-    battery_enable_pin = digitalio.DigitalInOut(BATTERY_ENABLE_PIN_ID); battery_enable_pin.direction = digitalio.Direction.OUTPUT; battery_enable_pin.value = True
-    battery_sense_pin = analogio.AnalogIn(BATTERY_SENSE_PIN_ID)
-    hardware_initialized = True
-except Exception as e: print(f"Hardware initialization error: {e}")
-
-if not hardware_initialized:
-    _critical_halt("Critical: Hardware Failure. Halting.")
-
-ble_initialized = False
-if hardware_initialized:
+def init_hardware():
+    """Initialize or reinitialize hardware objects"""
+    global click, enc
     try:
-        hid_service = HIDService()
-        mouse = Mouse(hid_service.devices)
-        keyboard = Keyboard(hid_service.devices)
-        keyboard_layout = KeyboardLayoutUS(keyboard)
-        device_info_service = DeviceInfoService(software_revision="1.1", manufacturer="SBU")
-        battery_service = BatteryService()
-        advertisement = ProvideServicesAdvertisement(hid_service, device_info_service, battery_service); advertisement.appearance = 962
-        unique_id = microcontroller.cpu.uid; device_id_suffix = "{:02X}{:02X}".format(unique_id[-2], unique_id[-1])
-        scan_response = Advertisement(); scan_response.complete_name = f"Dial Mouse {device_id_suffix}"
-        ble = adafruit_ble.BLERadio()
-        ble_initialized = True
-    except Exception as e: print(f"BLE initialization error: {e}")
+        click = digitalio.DigitalInOut(board.D10)
+        click.direction = digitalio.Direction.INPUT
+        click.pull = digitalio.Pull.UP
+        
+        enc = rotaryio.IncrementalEncoder(board.D7, board.D8)
+        return True
+    except Exception as e:
+        print(f"Hardware init failed: {e}")
+        return False
 
-if not ble_initialized and hardware_initialized:
-    _critical_halt("Critical: BLE Failure. Halting.")
+def init_ble():
+    """Initialize BLE services and advertising"""
+    try:
+        hid = HIDService()
+        kbd = Keyboard(hid.devices)
+        kbd_layout = KeyboardLayoutUS(kbd)
+        
+        device_info = DeviceInfoService(
+            software_revision="1.1", 
+            manufacturer="Stony Brook University"
+        )
+        
+        # Create advertisement with both HID and device info services
+        advertisement = ProvideServicesAdvertisement(hid, device_info)
+        advertisement.appearance = 961
+        
+        unique_id = microcontroller.cpu.uid
+        device_id = "{:02X}{:02X}".format(unique_id[-2], unique_id[-1])
+        
+        scan_response = Advertisement()
+        scan_response.complete_name = f"Dial Scroll {device_id}"
+        
+        ble = adafruit_ble.BLERadio()
+        
+        return ble, kbd, kbd_layout, advertisement, scan_response, device_id
+    except Exception as e:
+        print(f"BLE init failed: {e}")
+        return None, None, None, None, None, None, None
+
+def safe_enter_deep_sleep():
+    """Safely enter deep sleep with proper cleanup"""
+    global click, enc, ble, kbd, kbd_layout, advertisement, scan_response, device_id
+    
+    print("Entering deep sleep...")
+    led.value = False
+    
+    try:
+        # Disconnect BLE safely
+        if ble and ble.connected:
+            print("Disconnecting BLE connections...")
+            for connection in ble.connections:
+                try:
+                    connection.disconnect()
+                    time.sleep(0.1)
+                except:
+                    pass  # Ignore disconnect errors
+        
+        # Stop advertising and deinitialize BLE radio completely
+        if ble:
+            try:
+                if ble.advertising:
+                    print("Stopping BLE advertising...")
+                    ble.stop_advertising()
+                    time.sleep(0.1)
+                
+                # Release the BLE adapter
+                print("Releasing BLE adapter...")
+                if _bleio.adapter:
+                    _bleio.set_adapter(None)
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"BLE cleanup error: {e}")
+        
+        # Nullify BLE objects
+        ble = None
+        # mouse = None
+        kbd = None
+        kbd_layout = None
+        advertisement = None
+        scan_response = None
+        device_id = None
+
+        # Deinitialize hardware objects
+        try:
+            if click:
+                click.deinit()
+        except:
+            pass
+        
+        try:
+            if enc:
+                enc.deinit()
+        except:
+            pass
+        
+        # Create pin alarms for wakeup
+        # Using both edge detection for better encoder response
+        click_alarm = alarm.pin.PinAlarm(pin=board.D10, value=False, pull=True)
+        enc_a_alarm = alarm.pin.PinAlarm(pin=board.D7, value=False, pull=True)
+        enc_b_alarm = alarm.pin.PinAlarm(pin=board.D8, value=False, pull=True)
+        
+        # Enter deep sleep
+        alarm.exit_and_deep_sleep_until_alarms(
+            click_alarm,
+            enc_a_alarm,
+            enc_b_alarm
+        )
+        
+    except Exception as e:
+        print(f"Deep sleep error: {e}")
+        # If deep sleep fails, try to reinitialize hardware
+        time.sleep(1)
+        init_hardware()
+
+# Initialize everything
+if not init_hardware():
+    print("Critical: Hardware initialization failed")
+    while True:
+        led.value = not led.value
+        time.sleep(0.5)
+
+ble_result = init_ble()
+if ble_result[0] is None:
+    print("Critical: BLE initialization failed")
+    while True:
+        led.value = not led.value
+        time.sleep(0.5)
+
+ble, kbd, kbd_layout, advertisement, scan_response, device_id = ble_result
+
+time.sleep(0.1) # Added delay after successful BLE init
 
 last_activity_time = time.monotonic()
-last_battery_update_time = 0.0
 
-if alarm.wake_alarm: print(f"Wake: {alarm.wake_alarm}"); last_activity_time = time.monotonic()
+# Check if waking from deep sleep
+if alarm.wake_alarm is not None:
+    print(f"Waking from deep sleep: {alarm.wake_alarm}")
+    last_activity_time = time.monotonic()  # Reset activity timer
 
-button_press_start_time = None # Time when button was pressed
-long_press_mode_active = False # True when long press detected and preparing for sleep
-was_connected = ble.connected if ble else False
-last_position = enc.position if enc else 0 # Initialize last_position
+pending_single_click = False
+single_click_timer = 0
+double_click_threshold = 0.5  # seconds
+last_click_time = 0
+click_count = 0
 
+# Initialize tracking variables
+last_click = click.value
+last_position = enc.position
+button_press_start_time = None
+long_press_detected = False
+was_connected = ble.connected # For BLE connection prints
+
+# Start advertising if not connected
 try:
-    if ble and not ble.connected: print(f"Advertising: {scan_response.complete_name}"); ble.start_advertising(advertisement, scan_response)
-    elif ble and ble.connected: print("BLE Connected")
-except Exception as e: print(f"Advertising error: {e}")
+    if not ble.connected:
+        print(f"Starting advertising: {device_id}")
+        ble.start_advertising(advertisement, scan_response)
+    else:
+        print("Already connected")
+except Exception as e:
+    print(f"Advertising error: {e}")
 
-print("Loop")
+print("Entering main loop")
 
+# Main loop
 while True:
     try:
         current_time = time.monotonic()
-
-        if long_press_mode_active: # Special mode: waiting for button release to sleep
-            if click and click.value: # Button released
-                print("Long Press released. Entering deep sleep."); led.value = False
-                _safe_deinit(click)
-                # Other peripherals (enc, battery pins) deinitialized when long_press_mode_active was set.
-                
-                final_click_alarm = alarm.pin.PinAlarm(CLICK_PIN_ID, value=False, pull=True)
-                alarm.exit_and_deep_sleep_until_alarms(final_click_alarm)
-            else: # Button still held or click object is None
-                time.sleep(0.01) # Yield/debounce
-            continue # Skip all other processing in the main loop
-
+        
+        # Check for inactivity timeout
         if current_time - last_activity_time > INACTIVITY_TIMEOUT:
-            print("Inactivity sleep (Wake on D10 only)"); led.value = False
-            if ble and ble.connected:
-                for connection in ble.connections: 
-                    try: connection.disconnect()
-                    except: pass
-            if ble: ble.stop_advertising()
-            
-            # Deinitialize hardware components before sleep
-            _safe_deinit(click)
-            _safe_deinit(enc)
-            _safe_deinit(battery_sense_pin)
-            if battery_enable_pin:
-                try: battery_enable_pin.value = False; battery_enable_pin.deinit();
-                except: pass # Turn off and deinit
-
-            # For inactivity, wake on click pin press
-            # The diagnostic print for D10 only was here, I'll remove it as this is now the defined behavior
-            # print("Diagnostic: Inactivity sleep on D10 only") 
-            deep_sleep_click_alarm = alarm.pin.PinAlarm(CLICK_PIN_ID, False, pull=True)
-            alarm.exit_and_deep_sleep_until_alarms(deep_sleep_click_alarm)
+            safe_enter_deep_sleep()
         
+        # Read current input states
         try:
-            position, click_value = enc.position, click.value
-        except Exception as e: print(f"Input error: {e}. Continuing..."); time.sleep(LOOP_DELAY_CONNECTED if ble and ble.connected else LOOP_DELAY_DISCONNECTED); continue
+            position = enc.position
+            click_value = click.value
+        except Exception as e:
+            print(f"Input read error: {e}")
+            # Try to reinitialize hardware
+            if init_hardware():
+                last_click = click.value
+                last_position = enc.position
+            time.sleep(LOOP_DELAY_CONNECTED)
+            continue
         
+        # Handle encoder movement
         if last_position != position:
-            movement = last_position - position; last_position = position; last_activity_time = current_time
-            if ble and ble.connected:
-                try:
-                    mouse.move(y=int(movement))
-                    for i in range(abs(movement)):
-                        if (movement > 0):
-                            keyboard_layout.press(Keycode.U)
-                            keyboard_layout.release(Keycode.U)
-                        elif (movement < 0):
-                            keyboard_layout.press(Keycode.D)
-                            keyboard_layout.release(Keycode.D)
-                except Exception as e: print(f"Mouse move error: {e}")
-        
-        # New button logic for click and long press detection
-        if not click_value: # Button is currently pressed
-            if button_press_start_time is None: # Button was just pressed
-                button_press_start_time = last_activity_time = current_time # Register activity
-            # else: button is being held, check duration below
-            if button_press_start_time is not None and (current_time - button_press_start_time) >= LONG_PRESS_DURATION:
-                # Long press duration reached
-                print("Long Press detected. Preparing for sleep on release.")
-                led.value = True # Indicate long press processing
+            delta = position - last_position
 
-                if ble and ble.connected:
-                    print("Disconnecting BLE for Long Press...")
-                    for conn in ble.connections: 
-                        try: conn.disconnect()
-                        except: pass # Ignore errors
-                if ble: print("Stopping BLE advertising for Long Press..."); ble.stop_advertising()
-                
-                print("Deinitializing peripherals for Long Press...")
-                _safe_deinit(enc)
-                _safe_deinit(battery_sense_pin)
-                if battery_enable_pin:
-                    try: battery_enable_pin.value = False; battery_enable_pin.deinit();
-                    except: pass
-                
-                long_press_mode_active = True # Engage special mode (wait for release)
-                button_press_start_time = None # Prevent re-triggering LP detection, release will be handled by long_press_mode_active block
-        else: # Button is currently released
-            if button_press_start_time is not None: # Button was just released (and wasn't a long press that set long_press_mode_active)
-                # This path is for a short click release
-                if ble and ble.connected:
+            # Detect direction change
+            new_direction = 1 if delta > 0 else -1
+            if new_direction != last_scroll_direction and scroll_buffer != 0:
+                # Flush existing buffer immediately
+                print("Direction changed, flushing buffer early")
+                movement = scroll_buffer
+                scroll_buffer = 0
+                scroll_timer = 0
+
+                if ble.connected:
                     try:
-                        mouse.click(Mouse.LEFT_BUTTON); print("Click");
-                        keyboard_layout.press(Keycode.ENTER)
-                        keyboard_layout.release(Keycode.ENTER)
-                    except Exception as e: print(f"Mouse click error: {e}")
-                last_activity_time = current_time # Register activity
-                button_press_start_time = None # Reset for next press
+                        if abs(movement) >= 3:
+                            if movement > 0:
+                                print(f"Gesture: RIGHT ({movement} units)")
+                                kbd.press(Keycode.RIGHT_ARROW)
+                                kbd.release(Keycode.RIGHT_ARROW)
+                            else:
+                                print(f"Gesture: LEFT ({movement} units)")
+                                kbd.press(Keycode.LEFT_ARROW)
+                                kbd.release(Keycode.LEFT_ARROW)
+                        else:
+                            if movement > 0:
+                                print(f"Scrolled: DOWN ({movement} units)")
+                                for _ in range(movement):
+                                    kbd.press(Keycode.DOWN_ARROW)
+                                    kbd.release(Keycode.DOWN_ARROW)
+                            else:
+                                print(f"Scrolled: UP ({-movement} units)")
+                                for _ in range(-movement):
+                                    kbd.press(Keycode.UP_ARROW)
+                                    kbd.release(Keycode.UP_ARROW)
+                    except Exception as e:
+                        print(f"Buffered scroll error: {e}")
 
-        # BLE connection status change handling (only if not in long_press_mode)
-        if ble and ble.connected != was_connected:
-            print("BLE Connected" if ble.connected else "BLE Disconnected")
-            if ble.connected: # Still need this for the battery update
-                _read_and_update_battery_info(current_time)
+            # Continue normal buffering
+            scroll_buffer += delta
+            last_scroll_direction = new_direction
+            last_position = position
+            last_activity_time = current_time
+            scroll_timer = current_time  # reset batching timer
+
+
+        # Process buffered scroll after delay
+        if abs(scroll_buffer) > 0 and (current_time - scroll_timer) >= SCROLL_DELAY:
+            movement = scroll_buffer
+            scroll_buffer = 0  # reset buffer
+
+            if ble.connected:
+                try:
+                    if abs(movement) >= 3:
+                        if movement > 0:
+                            print(f"Gesture: RIGHT ({movement} units)")
+                            kbd.press(Keycode.RIGHT_ARROW)
+                            kbd.release(Keycode.RIGHT_ARROW)
+                        else:
+                            print(f"Gesture: LEFT ({movement} units)")
+                            kbd.press(Keycode.LEFT_ARROW)
+                            kbd.release(Keycode.LEFT_ARROW)
+                    else:
+                        if movement > 0:
+                            print(f"Scrolled: DOWN ({movement} units)")
+                            for _ in range(movement):
+                                kbd.press(Keycode.DOWN_ARROW)
+                                kbd.release(Keycode.DOWN_ARROW)
+                        else:
+                            print(f"Scrolled: UP ({-movement} units)")
+                            for _ in range(-movement):
+                                kbd.press(Keycode.UP_ARROW)
+                                kbd.release(Keycode.UP_ARROW)
+                except Exception as e:
+                    print(f"Buffered scroll error: {e}")
+
+        
+        # Handle button press/release and long press detection
+        if last_click != click_value:
+            if not click_value:  # Button pressed
+                button_press_start_time = current_time
+                long_press_detected = False
+                last_activity_time = current_time
+
+            else:  # Button released
+                press_duration = current_time - button_press_start_time
+                if press_duration >= LONG_PRESS_DURATION:
+                    print("Long press detected - entering deep sleep...")
+                    # Visual feedback for long press
+                    led.value = False
+                    time.sleep(0.1)
+                    led.value = True
+                    time.sleep(0.1)
+                    led.value = False
+                    time.sleep(0.1)
+                    led.value = True
+                    safe_enter_deep_sleep()
+                else:
+                    # Handle double-click
+                    if current_time - last_click_time < double_click_threshold:
+                        click_count += 1
+                    else:
+                        click_count = 1
+                    last_click_time = current_time
+
+                    if click_count == 3:
+                        print("Triple click detected - requesting Accessibility Settings")
+                        if ble.connected:
+                            try:
+                                    kbd.press(Keycode.F1)
+                                    kbd.release(Keycode.F1)
+                            except Exception as e:
+                                print(f"Triple click (Accessibility Settings) error: {e}")
+                        click_count = 0
+                        pending_single_click = False
+                    elif press_duration < 2.0:
+                        # Wait before confirming it's a single click
+                        pending_single_click = True
+                        single_click_timer = current_time
+
+                button_press_start_time = None
+                long_press_detected = False
+        
+        # Handle delayed single click (to check if it's truly single)
+        if pending_single_click and (current_time - single_click_timer) >= double_click_threshold:
+            if click_count == 1:
+                print("Click: ENTER")
+                if ble.connected:
+                    try:
+                        kbd.press(Keycode.ENTER)
+                        kbd.release(Keycode.ENTER)
+                    except Exception as e:
+                        print(f"Single click (ENTER) error: {e}")
+            elif click_count == 2:
+                print("Double click detected - sending BACK")
+                if ble.connected:
+                    try:
+                        kbd.press(Keycode.ESCAPE)
+                        kbd.release(Keycode.ESCAPE)
+                    except Exception as e:
+                        print(f"Double click (BACK) error: {e}")
+            elif click_count == 3:
+                print("Triple click detected - requesting Accessibility Settings")
+                if ble.connected:
+                    try:
+                        kbd.press(Keycode.ALT, Keycode.SHIFT, Keycode.A)
+                        kbd.release_all()
+                    except Exception as e:
+                        print(f"Triple click (Accessibility Settings) error: {e}")
+            
+            pending_single_click = False
+            click_count = 0
+
+        last_click = click_value
+        
+        # Track BLE connection state changes
+        if ble.connected != was_connected:
+            if ble.connected:
+                print("BLE connected")
+            else:
+                print("BLE disconnected")
             was_connected = ble.connected
         
-        # Main operational states: advertising or connected (only if not in long_press_mode)
-        if ble and not ble.connected:
-            led.value = bool(int(current_time * 2) % 2) # Blinking LED when not connected
-            try: 
-                if not ble.advertising: ble.start_advertising(advertisement, scan_response)
-            except Exception as e: print(f"Re-advertising error: {e}")
-            time.sleep(LOOP_DELAY_DISCONNECTED)
-        elif ble and ble.connected:
-            led.value = True # Solid LED when connected
-            if current_time - last_battery_update_time > BATTERY_UPDATE_INTERVAL:
-                # Perform periodic battery update
-                _read_and_update_battery_info(current_time)
-            time.sleep(LOOP_DELAY_CONNECTED)
-        elif ble is None and hardware_initialized:
-            _critical_halt("Critical: BLE None. Halting.", 0.2)
+        # Handle BLE connection state
+        if not ble.connected:
+            # Visual indication of disconnected state
+            if int(current_time * 2) % 2:
+                led.value = True
+            else:
+                led.value = False
 
+            # Always (re)start advertising immediately when disconnected
+            try:
+                ble.stop_advertising()  # Stop any previous advertising
+            except Exception:
+                pass  # Ignore if not advertising
+
+            try:
+                ble.start_advertising(advertisement, scan_response)
+                print("BLE advertising (discoverable)...")
+            except Exception as e:
+                print(f"Re-advertising error: {e}")
+
+            time.sleep(LOOP_DELAY_DISCONNECTED)
+        else:
+            # Connected - solid LED
+            led.value = True
+            time.sleep(LOOP_DELAY_CONNECTED)
+    
     except Exception as e:
-        _critical_halt(f"Loop error: {e}\\nDevice restart?", 0.2)
+        print(f"Main loop error: {e}")
+        time.sleep(LOOP_DELAY_CONNECTED)
+        continue
